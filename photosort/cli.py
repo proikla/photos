@@ -16,7 +16,13 @@ from photosort.metadata_store import (
 )
 from photosort.organizer import organize
 from photosort.progress import Progress
-from photosort.stats import format_stats, maybe_plot_focal_lengths
+from photosort.stats import (
+    format_stats,
+    matplotlib_available,
+    open_with_default_app,
+    plot_focal_lengths,
+    prompt_yes_no,
+)
 
 
 def _setup_logging(*, verbose: bool, quiet: bool, log_file: Path | None) -> None:
@@ -158,15 +164,52 @@ def cmd_stats(args: argparse.Namespace) -> int:
 
     print(f"source: {source}")
     print(format_stats(records, lens_filter=args.lens), end="")
+
+    # Chart path: explicit --chart, else next to library / cwd
     if args.chart:
-        ok = maybe_plot_focal_lengths(records, Path(args.chart), lens=args.lens)
-        if not ok:
-            print(
-                "warning: could not write chart (need matplotlib and focal-length data)",
-                file=sys.stderr,
+        chart_path = Path(args.chart)
+    elif path.is_dir():
+        chart_path = path / "photosort_focal_lengths.png"
+    else:
+        chart_path = path.parent / "photosort_focal_lengths.png"
+
+    want_chart = False
+    if args.no_chart_prompt:
+        want_chart = bool(args.chart) or args.open_chart
+    elif args.open_chart or args.chart:
+        want_chart = True
+    elif not args.quiet and sys.stdin.isatty() and sys.stdout.isatty():
+        # After scan: offer to draw + open
+        has_focal = any(r.get("focal_length_mm") is not None for r in records)
+        if has_focal:
+            want_chart = prompt_yes_no(
+                "Show focal-length chart (X=mm min→max, Y=photos)?",
+                default_yes=True,
             )
         else:
-            print(f"chart written: {args.chart}")
+            print("(no focal-length data — chart skipped)", file=sys.stderr)
+
+    if want_chart:
+        if not matplotlib_available():
+            print(
+                "error: matplotlib is required for charts\n"
+                "  pip install matplotlib",
+                file=sys.stderr,
+            )
+            return 2
+        ok = plot_focal_lengths(records, chart_path, lens=args.lens)
+        if not ok:
+            print("warning: could not write chart (no focal-length data?)", file=sys.stderr)
+        else:
+            print(f"chart written: {chart_path}")
+            if not args.no_open:
+                if open_with_default_app(chart_path):
+                    print(f"opened: {chart_path}")
+                else:
+                    print(
+                        f"could not auto-open; open manually: {chart_path}",
+                        file=sys.stderr,
+                    )
     return 0
 
 
@@ -247,7 +290,26 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Write/update metadata JSON (default path: DIR/{DEFAULT_METADATA_NAME})",
     )
     st.add_argument("--lens", help="Filter focal lengths to this lens name")
-    st.add_argument("--chart", help="Optional path to write a matplotlib bar chart PNG")
+    st.add_argument(
+        "--chart",
+        help="Write focal-length bar chart PNG to this path "
+        "(default after prompt: DIR/photosort_focal_lengths.png)",
+    )
+    st.add_argument(
+        "--open-chart",
+        action="store_true",
+        help="Build the chart and open it (skip Y/n prompt)",
+    )
+    st.add_argument(
+        "--no-chart-prompt",
+        action="store_true",
+        help="Do not ask to show a chart after scanning",
+    )
+    st.add_argument(
+        "--no-open",
+        action="store_true",
+        help="Write the chart PNG but do not open the default viewer",
+    )
     st.add_argument(
         "-v",
         "--verbose",

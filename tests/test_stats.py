@@ -21,3 +21,33 @@ def test_most_used_lenses_and_focals():
     assert cov["total"] == 5
     assert cov["with_lens"] == 4
     assert cov["without_lens"] == 1
+
+
+def test_focal_length_histogram_sorted_min_to_max():
+    from photosort.stats import focal_length_histogram
+
+    records = [
+        {"focal_length_mm": 85},
+        {"focal_length_mm": 24},
+        {"focal_length_mm": 24},
+        {"focal_length_mm": 50},
+        {"lens": "x", "focal_length_mm": None},
+    ]
+    hist = focal_length_histogram(records)
+    assert hist == [(24.0, 2), (50.0, 1), (85.0, 1)]
+
+
+def test_plot_focal_lengths_writes_png(tmp_path):
+    from photosort.stats import matplotlib_available, plot_focal_lengths
+
+    if not matplotlib_available():
+        import pytest
+        pytest.skip("matplotlib not installed")
+    records = [
+        {"focal_length_mm": 35},
+        {"focal_length_mm": 35},
+        {"focal_length_mm": 85},
+    ]
+    out = tmp_path / "focals.png"
+    assert plot_focal_lengths(records, out) is True
+    assert out.is_file() and out.stat().st_size > 0

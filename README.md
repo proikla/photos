@@ -60,7 +60,10 @@ photosort stats ./library
 photosort stats ./library --cache          # optional: use photosort_metadata.json
 photosort stats ./library --save
 photosort stats ./library --lens "NIKKOR Z 50mm f/1.8 S"
-photosort stats ./library --chart focals.png
+# After scan, prompts Y/n to show a bar chart (X=focal mm min→max, Y=count)
+# or non-interactive:
+photosort stats ./library --open-chart
+photosort stats ./library --chart focals.png --no-open
 
 # Or point at the JSON explicitly
 photosort stats ./library/photosort_metadata.json
