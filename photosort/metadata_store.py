@@ -6,7 +6,11 @@ import json
 from pathlib import Path
 from typing import Any, Optional
 
-from photosort.exif_utils import extract_metadata
+from photosort.exif_utils import (
+    extract_metadata,
+    extract_metadata_batch_exiftool,
+    exiftool_available,
+)
 from photosort.hasher import sha256_file
 from photosort.organizer import iter_images
 
@@ -30,6 +34,7 @@ def scan_photos_for_metadata(
     *,
     recursive: bool = True,
     progress: Optional[Any] = None,
+    hash_files: bool = False,
 ) -> list[dict[str, Any]]:
     """Walk ALL image files under root (recursive by default) and extract EXIF."""
     import os
@@ -49,22 +54,37 @@ def scan_photos_for_metadata(
     if progress is not None:
         noun = "directory" if dir_count == 1 else "directories"
         progress.status(f"Found {total} image(s) across {dir_count} {noun}")
+        if exiftool_available():
+            progress.status("Metadata reader: ExifTool (RAW lens/focal tags supported)")
+        else:
+            progress.status(
+                "Metadata reader: Pillow only — install exiftool for RAW lens tags "
+                "(e.g. sudo apt install libimage-exiftool-perl)"
+            )
         progress.phase(f"Reading EXIF ({total} file(s))")
 
     records: list[dict[str, Any]] = []
+    by_path: dict[str, dict[str, Any]] = {}
+    if exiftool_available() and files:
+        by_path = extract_metadata_batch_exiftool(files, progress=progress)
+
     for i, path in enumerate(files, start=1):
-        # Show relative path so deep folders are visible on the bar
         try:
             label = str(path.relative_to(root))
         except ValueError:
             label = path.name
-        if progress is not None:
+        # Progress already advanced in batch mode; still tick when falling back
+        if progress is not None and not by_path:
             progress.item(i, total, label)
         try:
-            meta = extract_metadata(path)
-            try:
-                meta["content_hash"] = sha256_file(path)
-            except OSError:
+            key = str(path.resolve())
+            meta = by_path.get(key) or extract_metadata(path)
+            if hash_files:
+                try:
+                    meta["content_hash"] = sha256_file(path)
+                except OSError:
+                    meta["content_hash"] = None
+            else:
                 meta["content_hash"] = None
             meta["source"] = str(path)
             meta["dest"] = str(path)
@@ -72,7 +92,11 @@ def scan_photos_for_metadata(
         except Exception:
             continue
     if progress is not None:
-        progress.done(f"Scanned {len(records)} image(s) from full tree")
+        with_lens = sum(1 for r in records if r.get("lens"))
+        progress.done(
+            f"Scanned {len(records)} image(s) from full tree "
+            f"({with_lens} with lens EXIF)"
+        )
     return records
 
 

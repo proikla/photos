@@ -26,6 +26,20 @@ python -m pip install -e ".[dev]"
 python -m pip install -e ".[charts]"
 ```
 
+### RAW metadata (important)
+
+Pillow cannot read lens/focal tags from most RAW files (CR2/NEF/ARW/DNG/…).
+Install **ExifTool** so `stats` / organize see the same tags as Lightroom:
+
+```bash
+# Debian/Ubuntu
+sudo apt install libimage-exiftool-perl
+# macOS
+brew install exiftool
+```
+
+`photosort stats` will print which reader it uses. Without ExifTool, RAW frames still count in "Photos scanned" but show up under "no lens EXIF".
+
 ## Usage
 
 ```bash
