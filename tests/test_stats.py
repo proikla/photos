@@ -1,4 +1,4 @@
-from photosort.stats import format_stats, most_used_focal_lengths, most_used_lenses
+from photosort.stats import coverage, format_stats, most_used_focal_lengths, most_used_lenses
 
 
 def test_most_used_lenses_and_focals():
@@ -13,5 +13,11 @@ def test_most_used_lenses_and_focals():
     focals = most_used_focal_lengths(records, lens="35mm f/1.8")
     assert focals[0] == (35, 2)
     text = format_stats(records)
+    assert "Photos scanned: 5" in text
     assert "35mm f/1.8" in text
     assert "85mm" in text
+    assert "no lens EXIF" in text
+    cov = coverage(records)
+    assert cov["total"] == 5
+    assert cov["with_lens"] == 4
+    assert cov["without_lens"] == 1

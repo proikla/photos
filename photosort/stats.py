@@ -34,25 +34,69 @@ def most_used_focal_lengths(
     return c.most_common(top)
 
 
+def coverage(records: list[dict[str, Any]]) -> dict[str, int]:
+    """How many records have each kind of EXIF field."""
+    total = len(records)
+    with_lens = sum(1 for r in records if r.get("lens"))
+    with_focal = sum(1 for r in records if r.get("focal_length_mm") is not None)
+    with_camera = sum(1 for r in records if r.get("camera"))
+    with_aperture = sum(1 for r in records if r.get("aperture"))
+    return {
+        "total": total,
+        "with_lens": with_lens,
+        "without_lens": total - with_lens,
+        "with_focal": with_focal,
+        "without_focal": total - with_focal,
+        "with_camera": with_camera,
+        "with_aperture": with_aperture,
+    }
+
+
 def format_stats(records: list[dict[str, Any]], lens_filter: Optional[str] = None) -> str:
+    cov = coverage(records)
     lines: list[str] = []
-    lines.append(f"Records: {len(records)}")
+    lines.append(f"Photos scanned: {cov['total']}")
+    lines.append("EXIF coverage:")
+    lines.append(
+        f"  lens model:     {cov['with_lens']:5d}  "
+        f"({cov['without_lens']} without / unknown)"
+    )
+    lines.append(
+        f"  focal length:   {cov['with_focal']:5d}  "
+        f"({cov['without_focal']} without / unknown)"
+    )
+    lines.append(f"  camera:         {cov['with_camera']:5d}")
+    lines.append(f"  aperture:       {cov['with_aperture']:5d}")
     lines.append("")
-    lines.append("Most-used lenses:")
-    for name, count in most_used_lenses(records):
+    lines.append(
+        "Most-used lenses "
+        f"(among {cov['with_lens']} photos that have LensModel in EXIF):"
+    )
+    lenses = most_used_lenses(records)
+    for name, count in lenses:
         lines.append(f"  {count:5d}  {name}")
-    if not most_used_lenses(records):
+    if not lenses:
         lines.append("  (none)")
+    if cov["without_lens"]:
+        lines.append(
+            f"  {cov['without_lens']:5d}  (no lens EXIF — phone/screenshot/edited/RAW without tag)"
+        )
     lines.append("")
     title = "Most-used focal lengths"
     if lens_filter:
         title += f" (lens={lens_filter})"
+    else:
+        title += f" (among {cov['with_focal']} photos with focal length)"
     lines.append(title + ":")
     fls = most_used_focal_lengths(records, lens=lens_filter)
     for fl, count in fls:
         lines.append(f"  {count:5d}  {fl} mm")
     if not fls:
         lines.append("  (none)")
+    if not lens_filter and cov["without_focal"]:
+        lines.append(
+            f"  {cov['without_focal']:5d}  (no focal length EXIF)"
+        )
     return "\n".join(lines) + "\n"
 
 
