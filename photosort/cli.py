@@ -129,6 +129,7 @@ def cmd_stats(args: argparse.Namespace) -> int:
         records, source = resolve_metadata_records(
             path,
             rescan=args.rescan,
+            use_cache=args.cache,
             recursive=not args.no_recursive,
             progress=progress,
         )
@@ -225,7 +226,12 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument(
         "--rescan",
         action="store_true",
-        help="Ignore cached JSON and re-read EXIF from image files",
+        help="Force a full EXIF walk of all subfolders (default for directories)",
+    )
+    st.add_argument(
+        "--cache",
+        action="store_true",
+        help="Use DIR/photosort_metadata.json instead of walking the tree",
     )
     st.add_argument(
         "--no-recursive",

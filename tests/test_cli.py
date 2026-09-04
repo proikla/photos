@@ -43,12 +43,12 @@ def test_cli_stats_from_library_folder_without_json(tmp_path: Path, capsys):
     assert not (lib / "photosort_metadata.json").exists()
     rc = main(["stats", str(lib)])
     assert rc == 0
-    out = capsys.readouterr().out
-    assert "Summilux 35" in out
-    assert "source: scan:" in out
+    captured = capsys.readouterr()
+    assert "Summilux 35" in captured.out
+    assert "source: scan:" in captured.out
 
 
-def test_cli_stats_prefers_cached_json_unless_rescan(tmp_path: Path, capsys):
+def test_cli_stats_walks_tree_by_default_even_if_cache_exists(tmp_path: Path, capsys):
     lib = tmp_path / "library"
     make_jpeg(
         lib / "x.jpg",
@@ -57,21 +57,44 @@ def test_cli_stats_prefers_cached_json_unless_rescan(tmp_path: Path, capsys):
         lens="Live Lens",
         focal=(50, 1),
     )
-    # Cached JSON with different lens name — should win without --rescan
     (lib / "photosort_metadata.json").write_text(
         '[{"lens": "Cached Lens", "focal_length_mm": 85}]\n',
         encoding="utf-8",
     )
     rc = main(["stats", str(lib)])
     assert rc == 0
-    out = capsys.readouterr().out
-    assert "Cached Lens" in out
-    assert "Live Lens" not in out
+    captured = capsys.readouterr()
+    assert "Live Lens" in captured.out
+    assert "source: scan:" in captured.out
 
-    rc2 = main(["stats", str(lib), "--rescan"])
+    rc2 = main(["stats", str(lib), "--cache"])
     assert rc2 == 0
-    out2 = capsys.readouterr().out
-    assert "Live Lens" in out2
+    captured2 = capsys.readouterr()
+    assert "Cached Lens" in captured2.out
+
+
+def test_cli_stats_walks_nested_directories(tmp_path: Path, capsys):
+    lib = tmp_path / "library"
+    make_jpeg(
+        lib / "2020" / "01" / "deep" / "a.jpg",
+        when=dt.datetime(2020, 1, 1),
+        color=(1, 0, 0),
+        lens="Nested A",
+        focal=(24, 1),
+    )
+    make_jpeg(
+        lib / "misc" / "b.jpg",
+        when=dt.datetime(2020, 2, 2),
+        color=(0, 1, 0),
+        lens="Nested B",
+        focal=(35, 1),
+    )
+    rc = main(["stats", str(lib)])
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "Nested A" in captured.out
+    assert "Nested B" in captured.out
+    assert "Found 2 image" in captured.err
 
 
 def test_cli_organize_prints_progress(tmp_path: Path, capsys):
@@ -93,3 +116,17 @@ def test_cli_quiet_hides_progress(tmp_path: Path, capsys):
     assert rc == 0
     err = capsys.readouterr().err
     assert "==>" not in err
+
+
+def test_progress_bar_contains_blocks():
+    from io import StringIO
+    from photosort.progress import Progress
+
+    buf = StringIO()
+    p = Progress(stream=buf, bar_width=10)
+    p.item(5, 10, "photo.jpg")
+    p.done()
+    text = buf.getvalue()
+    assert "█" in text
+    assert "░" in text
+    assert "50%" in text

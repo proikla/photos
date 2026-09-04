@@ -14,7 +14,7 @@ Safe Linux CLI photo organizer. Sorts chaotic folders into date-based trees **wi
   - Default mode is **COPY** (non-destructive); use `--move` to move
   - Every decision is logged; unique content-hash inventory is verified
 - **Metadata / stats**: aperture, focal length, lens, camera, shutter, ISO, datetime
-  - `photosort stats ./library` scans the folder (or uses `photosort_metadata.json` if organize already wrote it)
+  - `photosort stats ./library` walks **all subfolders** and reads EXIF (use `--cache` for JSON only)
   - most-used lenses / focal lengths; optional matplotlib chart
 
 ## Install
@@ -41,9 +41,9 @@ photosort organize ./inbox ./library --move
 # Preview only
 photosort organize ./inbox ./library --dry-run
 
-# Stats from a library folder (scans EXIF; uses cached JSON if present)
+# Stats: walks ALL subfolders by default (live EXIF)
 photosort stats ./library
-photosort stats ./library --rescan
+photosort stats ./library --cache          # optional: use photosort_metadata.json
 photosort stats ./library --save
 photosort stats ./library --lens "NIKKOR Z 50mm f/1.8 S"
 photosort stats ./library --chart focals.png

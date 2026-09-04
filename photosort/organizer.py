@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -57,14 +58,26 @@ class OrganizeResult:
 
 
 def iter_images(source: Path, recursive: bool = True) -> Iterable[Path]:
+    """Yield image files under source. Recursive uses os.walk (all subdirs)."""
     if source.is_file():
         if source.suffix.lower() in IMAGE_EXTENSIONS:
             yield source
         return
-    pattern = "**/*" if recursive else "*"
-    for p in sorted(source.glob(pattern)):
-        if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS:
-            yield p
+    if not source.is_dir():
+        return
+    if not recursive:
+        for name in sorted(os.listdir(source)):
+            p = source / name
+            if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS:
+                yield p
+        return
+    # Full tree: every subdirectory, files sorted per directory for stability
+    for dirpath, dirnames, filenames in os.walk(source, followlinks=False):
+        dirnames.sort()
+        for name in sorted(filenames):
+            p = Path(dirpath) / name
+            if p.suffix.lower() in IMAGE_EXTENSIONS and p.is_file():
+                yield p
 
 
 def date_subdir(when, depth: Depth) -> Path:
