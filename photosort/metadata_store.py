@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from photosort.exif_utils import extract_metadata
 from photosort.hasher import sha256_file
@@ -25,11 +25,22 @@ def load_metadata(path: Path) -> list[dict[str, Any]]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def scan_photos_for_metadata(root: Path, *, recursive: bool = True) -> list[dict[str, Any]]:
+def scan_photos_for_metadata(
+    root: Path,
+    *,
+    recursive: bool = True,
+    progress: Optional[Any] = None,
+) -> list[dict[str, Any]]:
     """Walk image files under root and extract EXIF into records."""
     root = root.resolve()
+    files = list(iter_images(root, recursive=recursive))
+    total = len(files)
+    if progress is not None:
+        progress.phase(f"Scanning EXIF in {total} image(s) under {root}")
     records: list[dict[str, Any]] = []
-    for path in iter_images(root, recursive=recursive):
+    for i, path in enumerate(files, start=1):
+        if progress is not None:
+            progress.item(i, total, f"exif {path.name}")
         try:
             meta = extract_metadata(path)
             try:
@@ -41,6 +52,8 @@ def scan_photos_for_metadata(root: Path, *, recursive: bool = True) -> list[dict
             records.append(meta)
         except Exception:
             continue
+    if progress is not None:
+        progress.done(f"Scanned {len(records)} image(s)")
     return records
 
 
@@ -49,6 +62,7 @@ def resolve_metadata_records(
     *,
     rescan: bool = False,
     recursive: bool = True,
+    progress: Optional[Any] = None,
 ) -> tuple[list[dict[str, Any]], str]:
     """
     Load stats records from a JSON file or a photo directory.
@@ -61,6 +75,8 @@ def resolve_metadata_records(
 
     if path.is_file():
         if path.suffix.lower() == ".json":
+            if progress is not None:
+                progress.phase(f"Loading metadata JSON: {path}")
             return load_metadata(path), f"json:{path}"
         # Single image file
         meta = extract_metadata(path)
@@ -75,9 +91,15 @@ def resolve_metadata_records(
     # Directory: prefer cached JSON unless --rescan
     cached = path / DEFAULT_METADATA_NAME
     if cached.is_file() and not rescan:
+        if progress is not None:
+            progress.phase(f"Loading cached metadata: {cached}")
         records = load_metadata(cached)
         if records:
+            if progress is not None:
+                progress.done(f"Loaded {len(records)} record(s) from cache")
             return records, f"json:{cached}"
+        if progress is not None:
+            progress.status("Cache empty — falling back to EXIF scan")
 
-    records = scan_photos_for_metadata(path, recursive=recursive)
+    records = scan_photos_for_metadata(path, recursive=recursive, progress=progress)
     return records, f"scan:{path}"

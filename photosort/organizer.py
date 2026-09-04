@@ -6,7 +6,7 @@ import logging
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Literal, Optional
+from typing import Any, Callable, Iterable, Literal, Optional
 
 from photosort.exif_utils import extract_metadata, get_photo_datetime
 from photosort.hasher import sha256_file
@@ -91,17 +91,29 @@ def unique_dest_path(dest_dir: Path, filename: str) -> Path:
         n += 1
 
 
-def build_dest_hash_index(dest_root: Path) -> dict[str, Path]:
+def build_dest_hash_index(
+    dest_root: Path,
+    *,
+    progress: Optional[Any] = None,
+) -> dict[str, Path]:
     """Map content hash -> path for images already in dest."""
     index: dict[str, Path] = {}
     if not dest_root.exists():
         return index
-    for p in iter_images(dest_root, recursive=True):
+    files = list(iter_images(dest_root, recursive=True))
+    total = len(files)
+    if progress is not None:
+        progress.status(f"Indexing {total} existing file(s) in destination…")
+    for i, p in enumerate(files, start=1):
+        if progress is not None:
+            progress.item(i, total, f"hash {p.name}")
         try:
             h = sha256_file(p)
             index[h] = p
         except OSError as e:
             logger.warning("Could not hash existing file %s: %s", p, e)
+    if progress is not None:
+        progress.done(f"Indexed {len(index)} unique content hash(es) in destination")
     return index
 
 
@@ -114,6 +126,7 @@ def organize(
     dry_run: bool = False,
     recursive: bool = True,
     collect_metadata: bool = True,
+    progress: Optional[Any] = None,
 ) -> OrganizeResult:
     """
     Sort images from source into dest date folders with content-hash safety.
@@ -127,20 +140,36 @@ def organize(
     source = source.resolve()
     dest = dest.resolve()
 
-    existing = build_dest_hash_index(dest)
-    result.hashes_before = set(existing.keys())
-    # Working index grows as we place files this run
-    hash_index: dict[str, Path] = dict(existing)
-    # Also track hashes of sources we've already placed this run
-    # (in case source itself has internal duplicates)
-
+    if progress is not None:
+        progress.phase(f"Scanning source: {source}")
+    candidates = []
     for src in iter_images(source, recursive=recursive):
-        # Skip files already under dest (avoid re-copying when source==dest subtree)
         try:
             if dest in src.parents or src == dest:
                 continue
         except Exception:
             pass
+        candidates.append(src)
+    if progress is not None:
+        progress.status(f"Found {len(candidates)} image(s) to process")
+
+    if progress is not None:
+        progress.phase("Indexing destination")
+    existing = build_dest_hash_index(dest, progress=progress)
+    result.hashes_before = set(existing.keys())
+    # Working index grows as we place files this run
+    hash_index: dict[str, Path] = dict(existing)
+
+    if progress is not None:
+        mode = "MOVE" if move else "COPY"
+        if dry_run:
+            mode = f"DRY-RUN {mode}"
+        progress.phase(f"Organizing ({mode}, depth={depth})")
+
+    total = len(candidates)
+    for i, src in enumerate(candidates, start=1):
+        if progress is not None:
+            progress.item(i, total, f"read {src.name}")
 
         try:
             content_hash = sha256_file(src)
@@ -158,6 +187,8 @@ def organize(
             )
             result.decisions.append(decision)
             logger.info("SKIP duplicate %s (== %s)", src, hash_index[content_hash])
+            if progress is not None:
+                progress.item(i, total, f"skip duplicate {src.name}")
             continue
 
         when = get_photo_datetime(src)
@@ -198,6 +229,9 @@ def organize(
             final if not dry_run else f"(dry-run) {final}",
             reason,
         )
+        if progress is not None:
+            dest_show = final if not dry_run else f"(dry-run) {final}"
+            progress.item(i, total, f"{action} {src.name} -> {dest_show}")
 
         if collect_metadata:
             try:
@@ -218,6 +252,14 @@ def organize(
             if d.action != "skipped_duplicate"
         }
     else:
-        result.hashes_after = set(build_dest_hash_index(dest).keys())
+        if progress is not None:
+            progress.phase("Verifying destination inventory")
+        result.hashes_after = set(build_dest_hash_index(dest, progress=progress).keys())
+
+    if progress is not None:
+        progress.done(
+            f"Done: copied/moved={result.copied + result.moved} "
+            f"renamed={result.renamed} skipped_dup={result.skipped}"
+        )
 
     return result

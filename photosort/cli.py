@@ -15,22 +15,43 @@ from photosort.metadata_store import (
     save_metadata,
 )
 from photosort.organizer import organize
+from photosort.progress import Progress
 from photosort.stats import format_stats, maybe_plot_focal_lengths
 
 
-def _setup_logging(verbose: bool, log_file: Path | None) -> None:
-    level = logging.DEBUG if verbose else logging.INFO
-    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
+def _setup_logging(*, verbose: bool, quiet: bool, log_file: Path | None) -> None:
+    """
+    - default: decisions go to log file only (progress covers stderr)
+    - verbose: also echo INFO/DEBUG decisions to stderr
+    - quiet: WARNING+ only
+    """
+    file_level = logging.DEBUG if verbose else logging.INFO
+    if quiet:
+        console_level = logging.WARNING
+    elif verbose:
+        console_level = logging.DEBUG
+    else:
+        console_level = logging.WARNING
+
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.setLevel(logging.DEBUG)
+
+    fmt = logging.Formatter(
+        "%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    console = logging.StreamHandler(sys.stderr)
+    console.setLevel(console_level)
+    console.setFormatter(fmt)
+    root.addHandler(console)
+
     if log_file is not None:
         log_file.parent.mkdir(parents=True, exist_ok=True)
-        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)s %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        handlers=handlers,
-        force=True,
-    )
+        fh = logging.FileHandler(log_file, encoding="utf-8")
+        fh.setLevel(file_level)
+        fh.setFormatter(fmt)
+        root.addHandler(fh)
 
 
 def cmd_organize(args: argparse.Namespace) -> int:
@@ -41,7 +62,20 @@ def cmd_organize(args: argparse.Namespace) -> int:
         return 2
 
     log_file = Path(args.log) if args.log else dest / "photosort.log"
-    _setup_logging(args.verbose, None if args.dry_run and not args.log else log_file)
+    _setup_logging(
+        verbose=args.verbose,
+        quiet=args.quiet,
+        log_file=None if args.dry_run and not args.log else log_file,
+    )
+    progress = Progress(quiet=args.quiet)
+    if not args.quiet:
+        progress.status(
+            f"photosort organize  source={source}  dest={dest}  "
+            f"depth={args.depth}  mode={'move' if args.move else 'copy'}"
+            + ("  dry-run" if args.dry_run else "")
+        )
+        if log_file and not (args.dry_run and not args.log):
+            progress.status(f"decision log: {log_file}")
 
     result = organize(
         source,
@@ -51,6 +85,7 @@ def cmd_organize(args: argparse.Namespace) -> int:
         dry_run=args.dry_run,
         recursive=not args.no_recursive,
         collect_metadata=True,
+        progress=progress,
     )
 
     meta_path = Path(args.metadata) if args.metadata else dest / DEFAULT_METADATA_NAME
@@ -89,11 +124,13 @@ def cmd_organize(args: argparse.Namespace) -> int:
 
 def cmd_stats(args: argparse.Namespace) -> int:
     path = Path(args.path)
+    progress = Progress(quiet=args.quiet)
     try:
         records, source = resolve_metadata_records(
             path,
             rescan=args.rescan,
             recursive=not args.no_recursive,
+            progress=progress,
         )
     except FileNotFoundError as e:
         print(f"error: {e}", file=sys.stderr)
@@ -161,7 +198,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--metadata",
         help=f"JSON metadata inventory path (default: DEST/{DEFAULT_METADATA_NAME})",
     )
-    org.add_argument("-v", "--verbose", action="store_true")
+    org.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Print every decision to stderr (also more detail in the log)",
+    )
+    org.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="Hide progress; only print the final summary",
+    )
     org.set_defaults(func=cmd_organize)
 
     st = sub.add_parser(
@@ -194,6 +242,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     st.add_argument("--lens", help="Filter focal lengths to this lens name")
     st.add_argument("--chart", help="Optional path to write a matplotlib bar chart PNG")
+    st.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Reserved for extra detail (progress is on by default)",
+    )
+    st.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="Hide progress; only print the stats report",
+    )
     st.set_defaults(func=cmd_stats)
 
     return p

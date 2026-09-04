@@ -72,3 +72,24 @@ def test_cli_stats_prefers_cached_json_unless_rescan(tmp_path: Path, capsys):
     assert rc2 == 0
     out2 = capsys.readouterr().out
     assert "Live Lens" in out2
+
+
+def test_cli_organize_prints_progress(tmp_path: Path, capsys):
+    src = tmp_path / "src"
+    dest = tmp_path / "dest"
+    make_jpeg(src / "p.jpg", when=dt.datetime(2022, 1, 1), color=(1, 2, 3))
+    rc = main(["organize", str(src), str(dest)])
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "==>" in err
+    assert "Found 1 image" in err or "Organizing" in err
+
+
+def test_cli_quiet_hides_progress(tmp_path: Path, capsys):
+    src = tmp_path / "src"
+    dest = tmp_path / "dest"
+    make_jpeg(src / "p.jpg", when=dt.datetime(2022, 1, 1), color=(3, 2, 1))
+    rc = main(["organize", str(src), str(dest), "--quiet"])
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "==>" not in err

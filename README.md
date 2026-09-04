@@ -54,6 +54,14 @@ photosort stats ./library/photosort_metadata.json
 
 Also: `python -m photosort …`
 
+## Progress / verbosity
+
+By default both `organize` and `stats` print live progress on stderr (`==> phase`, `[n/total] …`).
+
+- `-v` / `--verbose` (`organize`): also echo every decision to stderr
+- `-q` / `--quiet`: hide progress; final summary/stats only
+- Full decision log for organize: `DEST/photosort.log` (override with `--log`)
+
 ## Tests
 
 ```bash
