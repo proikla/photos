@@ -8,9 +8,14 @@ import sys
 from pathlib import Path
 
 from photosort import __version__
-from photosort.metadata_store import load_metadata, save_metadata
+from photosort.metadata_store import (
+    DEFAULT_METADATA_NAME,
+    load_metadata,
+    resolve_metadata_records,
+    save_metadata,
+)
 from photosort.organizer import organize
-from photosort.stats import format_stats, maybe_plot_focal_lengths, stats_from_file
+from photosort.stats import format_stats, maybe_plot_focal_lengths
 
 
 def _setup_logging(verbose: bool, log_file: Path | None) -> None:
@@ -48,13 +53,14 @@ def cmd_organize(args: argparse.Namespace) -> int:
         collect_metadata=True,
     )
 
-    meta_path = Path(args.metadata) if args.metadata else dest / "photosort_metadata.json"
+    meta_path = Path(args.metadata) if args.metadata else dest / DEFAULT_METADATA_NAME
     if result.metadata and not args.dry_run:
         # Merge with existing inventory by content_hash
         existing = {r.get("content_hash"): r for r in load_metadata(meta_path) if r.get("content_hash")}
         for r in result.metadata:
             existing[r["content_hash"]] = r
         save_metadata(list(existing.values()), meta_path)
+        print(f"metadata: {meta_path}")
 
     print(f"decisions: {len(result.decisions)}")
     print(f"  copied/moved: {result.copied + result.moved}")
@@ -82,11 +88,37 @@ def cmd_organize(args: argparse.Namespace) -> int:
 
 
 def cmd_stats(args: argparse.Namespace) -> int:
-    meta_path = Path(args.metadata)
-    if not meta_path.exists():
-        print(f"error: metadata file not found: {meta_path}", file=sys.stderr)
+    path = Path(args.path)
+    try:
+        records, source = resolve_metadata_records(
+            path,
+            rescan=args.rescan,
+            recursive=not args.no_recursive,
+        )
+    except FileNotFoundError as e:
+        print(f"error: {e}", file=sys.stderr)
         return 2
-    records = load_metadata(meta_path)
+
+    if not records:
+        print(
+            f"error: no photo metadata found under {path}\n"
+            f"hint: pass your library folder, e.g. photosort stats ./library\n"
+            f"      or run organize first, then photosort stats ./library",
+            file=sys.stderr,
+        )
+        return 2
+
+    if args.save is not None:
+        if isinstance(args.save, str):
+            save_path = Path(args.save)
+        elif path.is_dir():
+            save_path = path / DEFAULT_METADATA_NAME
+        else:
+            save_path = path.parent / DEFAULT_METADATA_NAME
+        save_metadata(records, save_path)
+        print(f"metadata saved: {save_path}")
+
+    print(f"source: {source}")
     print(format_stats(records, lens_filter=args.lens), end="")
     if args.chart:
         ok = maybe_plot_focal_lengths(records, Path(args.chart), lens=args.lens)
@@ -127,17 +159,38 @@ def build_parser() -> argparse.ArgumentParser:
     org.add_argument("--log", help="Decision log file (default: DEST/photosort.log)")
     org.add_argument(
         "--metadata",
-        help="JSON metadata inventory path (default: DEST/photosort_metadata.json)",
+        help=f"JSON metadata inventory path (default: DEST/{DEFAULT_METADATA_NAME})",
     )
     org.add_argument("-v", "--verbose", action="store_true")
     org.set_defaults(func=cmd_organize)
 
-    st = sub.add_parser("stats", help="Show lens / focal-length stats from metadata JSON")
+    st = sub.add_parser(
+        "stats",
+        help="Show lens / focal-length stats from a library folder or metadata JSON",
+    )
     st.add_argument(
-        "metadata",
+        "path",
         nargs="?",
-        default="photosort_metadata.json",
-        help="Path to metadata JSON",
+        default=".",
+        help="Library folder (scans photos) or photosort_metadata.json (default: .)",
+    )
+    st.add_argument(
+        "--rescan",
+        action="store_true",
+        help="Ignore cached JSON and re-read EXIF from image files",
+    )
+    st.add_argument(
+        "--no-recursive",
+        action="store_true",
+        help="When scanning a folder, do not descend into subfolders",
+    )
+    st.add_argument(
+        "--save",
+        nargs="?",
+        const=True,
+        default=None,
+        metavar="FILE",
+        help=f"Write/update metadata JSON (default path: DIR/{DEFAULT_METADATA_NAME})",
     )
     st.add_argument("--lens", help="Filter focal lengths to this lens name")
     st.add_argument("--chart", help="Optional path to write a matplotlib bar chart PNG")
