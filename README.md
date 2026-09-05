@@ -7,11 +7,15 @@ Safe Linux CLI photo organizer. Sorts chaotic folders into date-based trees **wi
 - **Date folders** from EXIF `DateTimeOriginal` → `DateTime` → file mtime
   - `--depth month` (default): `YYYY/MM/`
   - `--depth day`: `YYYY/MM/DD/`
+- **In-place or into a library**
+  - `photosort organize SOURCE` — dest omitted → sort **in place** under `SOURCE` into `YYYY/MM`
+  - `photosort organize SOURCE DEST` — sort from source into dest
 - **Duplicate safety (content SHA-256)**
   - Same filename ≠ duplicate
   - Same name, different bytes → keep **both** (safe `_1`, `_2`, … rename)
-  - Identical bytes → skip redundant copy (never overwrite unique files)
-  - Default mode is **COPY** (non-destructive); use `--move` to move
+  - Identical bytes → skip redundant transfer (never overwrite unique files)
+  - Already at the correct date path → left alone (`already_sorted`)
+  - Default mode is **MOVE**; use `--copy` for non-destructive copy (`--move` kept as explicit alias)
   - Every decision is logged; unique content-hash inventory is verified
 - **Metadata / stats**: aperture, focal length, lens, camera, shutter, ISO, datetime
   - `photosort stats ./library` walks **all subfolders** and reads EXIF (use `--cache` for JSON only)
@@ -43,13 +47,19 @@ brew install exiftool
 ## Usage
 
 ```bash
-# Copy into YYYY/MM/ (default), never delete sources
+# In-place sort under ./inbox into YYYY/MM/ (default MOVE)
+photosort organize ./inbox
+
+# Move into a separate library
 photosort organize ./inbox ./library
+
+# Non-destructive copy instead of move
+photosort organize ./inbox ./library --copy
 
 # Day-level folders
 photosort organize ./inbox ./library --depth day
 
-# Move instead of copy
+# Explicit move (default; alias for back-compat)
 photosort organize ./inbox ./library --move
 
 # Preview only

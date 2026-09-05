@@ -62,10 +62,17 @@ def _setup_logging(*, verbose: bool, quiet: bool, log_file: Path | None) -> None
 
 def cmd_organize(args: argparse.Namespace) -> int:
     source = Path(args.source)
-    dest = Path(args.dest)
     if not source.exists():
         print(f"error: source does not exist: {source}", file=sys.stderr)
         return 2
+
+    # dest optional: omit → in-place sort under source
+    dest = Path(args.dest) if args.dest is not None else source
+    inplace = source.resolve() == dest.resolve()
+
+    # Default is MOVE; --copy opts into non-destructive copy. --move is an
+    # explicit no-op alias for the default (back-compat).
+    move = not bool(getattr(args, "copy", False))
 
     log_file = Path(args.log) if args.log else dest / "photosort.log"
     _setup_logging(
@@ -75,10 +82,15 @@ def cmd_organize(args: argparse.Namespace) -> int:
     )
     progress = Progress(quiet=args.quiet)
     if not args.quiet:
+        if inplace:
+            progress.status(
+                f"in-place sort under {source} ({'move' if move else 'copy'})"
+            )
         progress.status(
             f"photosort organize  source={source}  dest={dest}  "
-            f"depth={args.depth}  mode={'move' if args.move else 'copy'}"
+            f"depth={args.depth}  mode={'move' if move else 'copy'}"
             + ("  dry-run" if args.dry_run else "")
+            + ("  in-place" if inplace else "")
         )
         if log_file and not (args.dry_run and not args.log):
             progress.status(f"decision log: {log_file}")
@@ -87,7 +99,7 @@ def cmd_organize(args: argparse.Namespace) -> int:
         source,
         dest,
         depth=args.depth,
-        move=args.move,
+        move=move,
         dry_run=args.dry_run,
         recursive=not args.no_recursive,
         collect_metadata=True,
@@ -107,12 +119,23 @@ def cmd_organize(args: argparse.Namespace) -> int:
     print(f"  copied/moved: {result.copied + result.moved}")
     print(f"  renamed:      {result.renamed}")
     print(f"  skipped dup:  {result.skipped}")
+    print(f"  already sorted: {result.already_sorted}")
     print(f"hashes before:  {len(result.hashes_before)}")
     print(f"hashes after:   {len(result.hashes_after)}")
 
-    # Unique content inventory: after should equal before ∪ newly placed
-    newly = {d.content_hash for d in result.decisions if d.action != "skipped_duplicate"}
-    expected = result.hashes_before | newly
+    # Unique content inventory: after should equal before ∪ newly placed.
+    # skipped_duplicate / skipped_already_sorted do not add new hashes.
+    # For in-place moves, hashes_after must equal hashes_before (all unique
+    # content preserved; already_sorted is not a loss).
+    newly = {
+        d.content_hash
+        for d in result.decisions
+        if d.action not in ("skipped_duplicate", "skipped_already_sorted")
+    }
+    if inplace:
+        expected = set(result.hashes_before)
+    else:
+        expected = result.hashes_before | newly
     if not args.dry_run and result.hashes_after != expected:
         missing = expected - result.hashes_after
         extra = result.hashes_after - expected
@@ -221,9 +244,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = p.add_subparsers(dest="command", required=True)
 
-    org = sub.add_parser("organize", help="Sort photos from source into dest by date")
+    org = sub.add_parser(
+        "organize",
+        help="Sort photos by date (dest optional → in-place under source)",
+    )
     org.add_argument("source", help="Source file or directory")
-    org.add_argument("dest", help="Destination root directory")
+    org.add_argument(
+        "dest",
+        nargs="?",
+        default=None,
+        help="Destination root (default: same as source — in-place YYYY/MM)",
+    )
     org.add_argument(
         "--depth",
         choices=("month", "day"),
@@ -231,9 +262,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Folder depth: YYYY/MM (default) or YYYY/MM/DD",
     )
     org.add_argument(
+        "--copy",
+        action="store_true",
+        help="Copy files instead of moving (default is MOVE)",
+    )
+    org.add_argument(
         "--move",
         action="store_true",
-        help="Move files instead of copying (default is non-destructive copy)",
+        help="Move files (default; kept as explicit alias for back-compat)",
     )
     org.add_argument("--dry-run", action="store_true", help="Log actions without writing")
     org.add_argument("--no-recursive", action="store_true", help="Do not scan subfolders")

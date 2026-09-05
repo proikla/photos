@@ -24,7 +24,14 @@ IMAGE_EXTENSIONS = {
 SIDECAR_EXTENSIONS = (".xmp", ".XMP", ".aae", ".AAE")
 
 Depth = Literal["month", "day"]
-Action = Literal["copied", "moved", "skipped_duplicate", "renamed_and_copied", "renamed_and_moved"]
+Action = Literal[
+    "copied",
+    "moved",
+    "skipped_duplicate",
+    "skipped_already_sorted",
+    "renamed_and_copied",
+    "renamed_and_moved",
+]
 
 
 @dataclass
@@ -54,6 +61,10 @@ class OrganizeResult:
     @property
     def skipped(self) -> int:
         return sum(1 for d in self.decisions if d.action == "skipped_duplicate")
+
+    @property
+    def already_sorted(self) -> int:
+        return sum(1 for d in self.decisions if d.action == "skipped_already_sorted")
 
     @property
     def renamed(self) -> int:
@@ -212,6 +223,21 @@ def build_dest_hash_index(
     return index
 
 
+def _same_path(a: Path, b: Path) -> bool:
+    """True if a and b refer to the same filesystem object (path or inode)."""
+    try:
+        if a.resolve() == b.resolve():
+            return True
+    except OSError:
+        pass
+    try:
+        if a.exists() and b.exists() and a.samefile(b):
+            return True
+    except OSError:
+        pass
+    return False
+
+
 def _record_metadata(
     result: OrganizeResult,
     *,
@@ -231,10 +257,10 @@ def _record_metadata(
 
 def organize(
     source: Path,
-    dest: Path,
+    dest: Path | None = None,
     *,
     depth: Depth = "month",
-    move: bool = False,
+    move: bool = True,
     dry_run: bool = False,
     recursive: bool = True,
     collect_metadata: bool = True,
@@ -244,21 +270,29 @@ def organize(
     Sort images from source into dest date folders with content-hash safety.
 
     Rules:
-    - Same content hash already in dest → skip (true duplicate).
+    - If dest is omitted, dest = source (in-place sort into YYYY/MM under source).
+    - Same content hash already at a *different* path → skip (true duplicate).
     - Same filename, different content → keep both via safe suffix rename.
-    - Never overwrite unique files. Default is COPY; MOVE only if move=True.
+    - Already at the correct date path → skip (already_sorted); refresh metadata OK.
+    - Never overwrite unique files. Default is MOVE; use move=False / --copy to copy.
     - Metadata is ALWAYS extracted from the source path BEFORE move/copy.
     """
     result = OrganizeResult()
     source = source.resolve()
-    dest = dest.resolve()
+    if dest is None:
+        dest = source
+    else:
+        dest = dest.resolve()
+    inplace = source == dest
 
     if progress is not None:
         progress.phase(f"Scanning source: {source}")
     candidates = []
     for src in iter_images(source, recursive=recursive):
         try:
-            if dest in src.parents or src == dest:
+            # Only skip files already under a *foreign* dest. When inplace,
+            # every image under source must be processed.
+            if not inplace and (dest in src.parents or src == dest):
                 continue
         except (OSError, ValueError) as e:
             logger.debug("Skipping path containment check for %s: %s", src, e)
@@ -277,7 +311,8 @@ def organize(
         mode = "MOVE" if move else "COPY"
         if dry_run:
             mode = f"DRY-RUN {mode}"
-        progress.phase(f"Organizing ({mode}, depth={depth})")
+        where = "in-place" if inplace else str(dest)
+        progress.phase(f"Organizing ({mode}, depth={depth}, dest={where})")
 
     total = len(candidates)
     for i, src in enumerate(candidates, start=1):
@@ -291,26 +326,55 @@ def organize(
             continue
 
         if content_hash in hash_index:
-            decision = Decision(
-                source=src,
-                dest=None,
-                action="skipped_duplicate",
-                content_hash=content_hash,
-                reason=f"identical content already at {hash_index[content_hash]}",
-            )
-            result.decisions.append(decision)
-            logger.info("SKIP duplicate %s (== %s)", src, hash_index[content_hash])
-            if progress is not None:
-                progress.item(i, total, f"skip duplicate {src.name}")
-            continue
+            existing_at = hash_index[content_hash]
+            if not _same_path(existing_at, src):
+                # True duplicate of another file → skip
+                decision = Decision(
+                    source=src,
+                    dest=None,
+                    action="skipped_duplicate",
+                    content_hash=content_hash,
+                    reason=f"identical content already at {existing_at}",
+                )
+                result.decisions.append(decision)
+                logger.info("SKIP duplicate %s (== %s)", src, existing_at)
+                if progress is not None:
+                    progress.item(i, total, f"skip duplicate {src.name}")
+                continue
+            # else same file (in-place self-hit) → continue to relocate logic
 
         when = get_photo_datetime(src)
         sub = date_subdir(when, depth)
         dest_dir = dest / sub
         intended = dest_dir / src.name
 
+        # Already at the correct date path (same path or same inode)
+        if _same_path(src, intended):
+            meta: Optional[dict] = None
+            if collect_metadata:
+                meta = extract_metadata_safe(src, content_hash=content_hash)
+            decision = Decision(
+                source=src,
+                dest=intended,
+                action="skipped_already_sorted",
+                content_hash=content_hash,
+                reason="already_sorted",
+            )
+            result.decisions.append(decision)
+            logger.info("SKIP already_sorted %s", src)
+            if progress is not None:
+                progress.item(i, total, f"already sorted {src.name}")
+            if collect_metadata and meta is not None:
+                _record_metadata(
+                    result, src=src, final=intended, content_hash=content_hash, meta=meta
+                )
+            # Keep hash_index pointing at this path
+            hash_index[content_hash] = intended
+            continue
+
         if intended.exists():
-            # Name collision but different content (we already know hash differs)
+            # Name collision but different content (we already know hash differs /
+            # not the same inode as src — that case was handled above).
             final = unique_dest_path(dest_dir, src.name)
             action: Action = "renamed_and_moved" if move else "renamed_and_copied"
             reason = f"name conflict with different content; using {final.name}"
@@ -321,7 +385,7 @@ def organize(
 
         # CRITICAL: extract full metadata from SOURCE while it still exists
         # (before move/copy). Never read a vanished source after shutil.move.
-        meta: Optional[dict] = None
+        meta = None
         if collect_metadata:
             meta = extract_metadata_safe(src, content_hash=content_hash)
 
@@ -396,8 +460,12 @@ def organize(
         result.hashes_after = set(result.hashes_before) | {
             d.content_hash
             for d in result.decisions
-            if d.action != "skipped_duplicate"
+            if d.action not in ("skipped_duplicate", "skipped_already_sorted")
         }
+        # already_sorted hashes were already in hashes_before; for dry-run
+        # moves/copies we union newly placed. Inplace dry-run: before == after.
+        if inplace:
+            result.hashes_after = set(result.hashes_before)
     else:
         if progress is not None:
             progress.phase("Verifying destination inventory")
@@ -406,7 +474,8 @@ def organize(
     if progress is not None:
         progress.done(
             f"Done: copied/moved={result.copied + result.moved} "
-            f"renamed={result.renamed} skipped_dup={result.skipped}"
+            f"renamed={result.renamed} skipped_dup={result.skipped} "
+            f"already_sorted={result.already_sorted}"
         )
 
     return result

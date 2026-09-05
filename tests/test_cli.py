@@ -133,7 +133,7 @@ def test_progress_bar_contains_blocks():
 
 
 def test_cli_organize_move_writes_metadata_json(tmp_path: Path):
-    """Regression: --move must still populate photosort_metadata.json with EXIF."""
+    """Regression: move must still populate photosort_metadata.json with EXIF."""
     src = tmp_path / "src"
     dest = tmp_path / "dest"
     original = make_jpeg(
@@ -157,3 +157,56 @@ def test_cli_organize_move_writes_metadata_json(tmp_path: Path):
     assert records[0].get("meta_source") != "fallback"
     assert isinstance(records[0].get("exif"), dict)
 
+
+def test_cli_default_is_move_without_copy(tmp_path: Path):
+    """Default CLI is move: without --copy, source file leaves inbox."""
+    src = tmp_path / "inbox"
+    dest = tmp_path / "library"
+    original = make_jpeg(src / "p.jpg", when=dt.datetime(2022, 1, 1), color=(1, 2, 3))
+    rc = main(["organize", str(src), str(dest), "--quiet"])
+    assert rc == 0
+    assert not original.exists()
+    assert (dest / "2022" / "01" / "p.jpg").is_file()
+
+
+def test_cli_copy_keeps_source(tmp_path: Path):
+    src = tmp_path / "inbox"
+    dest = tmp_path / "library"
+    original = make_jpeg(src / "p.jpg", when=dt.datetime(2022, 1, 1), color=(3, 2, 1))
+    content = original.read_bytes()
+    rc = main(["organize", str(src), str(dest), "--copy", "--quiet"])
+    assert rc == 0
+    assert original.is_file()
+    assert original.read_bytes() == content
+    assert (dest / "2022" / "01" / "p.jpg").is_file()
+
+
+def test_cli_inplace_omitted_dest(tmp_path: Path, capsys):
+    root = tmp_path / "photos"
+    make_jpeg(root / "loose.jpg", when=dt.datetime(2021, 7, 7), color=(7, 7, 7))
+    rc = main(["organize", str(root)])
+    assert rc == 0
+    assert (root / "2021" / "07" / "loose.jpg").is_file()
+    assert not (root / "loose.jpg").exists()
+    err = capsys.readouterr().err
+    assert "in-place sort under" in err
+    assert "(move)" in err
+
+
+def test_cli_inplace_inventory_ok_with_already_sorted(tmp_path: Path, capsys):
+    root = tmp_path / "lib"
+    make_jpeg(
+        root / "2020" / "01" / "a.jpg",
+        when=dt.datetime(2020, 1, 1),
+        color=(1, 0, 0),
+    )
+    make_jpeg(
+        root / "dump" / "b.jpg",
+        when=dt.datetime(2020, 2, 2),
+        color=(0, 1, 0),
+    )
+    rc = main(["organize", str(root), "--quiet"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "inventory: OK" in out
+    assert "already sorted:" in out
