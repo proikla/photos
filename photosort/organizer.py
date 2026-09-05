@@ -7,9 +7,9 @@ import os
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, Literal, Optional
+from typing import Any, Iterable, Literal, Optional
 
-from photosort.exif_utils import extract_metadata, get_photo_datetime
+from photosort.exif_utils import extract_metadata_safe, get_photo_datetime
 from photosort.hasher import sha256_file
 
 logger = logging.getLogger("photosort")
@@ -19,6 +19,9 @@ IMAGE_EXTENSIONS = {
     ".heic", ".heif", ".bmp", ".gif", ".raw", ".cr2",
     ".nef", ".arw", ".dng", ".orf", ".rw2",
 }
+
+# Sidecar extensions photographers expect beside a photo (same basename / stem).
+SIDECAR_EXTENSIONS = (".xmp", ".XMP", ".aae", ".AAE")
 
 Depth = Literal["month", "day"]
 Action = Literal["copied", "moved", "skipped_duplicate", "renamed_and_copied", "renamed_and_moved"]
@@ -104,6 +107,85 @@ def unique_dest_path(dest_dir: Path, filename: str) -> Path:
         n += 1
 
 
+def find_sidecars(photo: Path) -> list[Path]:
+    """
+    Sidecar files next to a photo that should travel with it.
+    - same stem: IMG_001.xmp beside IMG_001.CR2 / IMG_001.jpg
+    - appended: IMG_001.jpg.xmp beside IMG_001.jpg
+    """
+    found: list[Path] = []
+    seen: set[Path] = set()
+    parent = photo.parent
+    stem = photo.stem
+    name = photo.name
+
+    for ext in SIDECAR_EXTENSIONS:
+        candidates = (
+            parent / f"{stem}{ext}",
+            parent / f"{name}{ext}",
+        )
+        for c in candidates:
+            try:
+                resolved = c.resolve()
+            except OSError:
+                resolved = c
+            if resolved in seen:
+                continue
+            if c.is_file():
+                seen.add(resolved)
+                found.append(c)
+    return found
+
+
+def sidecar_dest_for(src_sidecar: Path, src_photo: Path, dest_photo: Path) -> Path:
+    """Map a source sidecar path onto the destination photo's basename."""
+    # Appended style: photo.jpg.xmp → dest.jpg.xmp
+    if src_sidecar.name.lower().startswith(src_photo.name.lower()) and len(src_sidecar.name) > len(
+        src_photo.name
+    ):
+        extra = src_sidecar.name[len(src_photo.name) :]
+        return Path(str(dest_photo) + extra)
+    # Same-stem style: photo.xmp → dest.xmp (preserve sidecar suffix casing from source)
+    return dest_photo.with_suffix(src_sidecar.suffix)
+
+
+def transfer_sidecars(
+    src_photo: Path,
+    dest_photo: Path,
+    *,
+    move: bool,
+    dry_run: bool,
+) -> list[tuple[Path, Path]]:
+    """Copy or move sidecars alongside the photo. Returns list of (src, dest) pairs."""
+    transferred: list[tuple[Path, Path]] = []
+    for sc in find_sidecars(src_photo):
+        dest_sc = sidecar_dest_for(sc, src_photo, dest_photo)
+        if dest_sc.exists():
+            # Avoid clobbering an existing sidecar; suffix like photo_1.xmp already
+            # matches renamed dest stem. If still colliding, pick unique name.
+            dest_sc = unique_dest_path(dest_sc.parent, dest_sc.name)
+        if dry_run:
+            transferred.append((sc, dest_sc))
+            logger.info("DRY-RUN sidecar %s -> %s", sc, dest_sc)
+            continue
+        dest_sc.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if move:
+                shutil.move(str(sc), str(dest_sc))
+            else:
+                shutil.copy2(str(sc), str(dest_sc))
+            transferred.append((sc, dest_sc))
+            logger.info(
+                "%s sidecar %s -> %s",
+                "MOVED" if move else "COPIED",
+                sc,
+                dest_sc,
+            )
+        except OSError as e:
+            logger.error("Failed to %s sidecar %s -> %s: %s", "move" if move else "copy", sc, dest_sc, e)
+    return transferred
+
+
 def build_dest_hash_index(
     dest_root: Path,
     *,
@@ -130,6 +212,23 @@ def build_dest_hash_index(
     return index
 
 
+def _record_metadata(
+    result: OrganizeResult,
+    *,
+    src: Path,
+    final: Path,
+    content_hash: str,
+    meta: dict,
+) -> None:
+    meta = dict(meta)
+    meta["source"] = str(src)
+    meta["dest"] = str(final)
+    meta["path"] = str(final)
+    meta["filename"] = final.name
+    meta["content_hash"] = content_hash
+    result.metadata.append(meta)
+
+
 def organize(
     source: Path,
     dest: Path,
@@ -148,6 +247,7 @@ def organize(
     - Same content hash already in dest → skip (true duplicate).
     - Same filename, different content → keep both via safe suffix rename.
     - Never overwrite unique files. Default is COPY; MOVE only if move=True.
+    - Metadata is ALWAYS extracted from the source path BEFORE move/copy.
     """
     result = OrganizeResult()
     source = source.resolve()
@@ -160,8 +260,8 @@ def organize(
         try:
             if dest in src.parents or src == dest:
                 continue
-        except Exception:
-            pass
+        except (OSError, ValueError) as e:
+            logger.debug("Skipping path containment check for %s: %s", src, e)
         candidates.append(src)
     if progress is not None:
         progress.status(f"Found {len(candidates)} image(s) to process")
@@ -219,12 +319,52 @@ def organize(
             action = "moved" if move else "copied"
             reason = "ok"
 
+        # CRITICAL: extract full metadata from SOURCE while it still exists
+        # (before move/copy). Never read a vanished source after shutil.move.
+        meta: Optional[dict] = None
+        if collect_metadata:
+            meta = extract_metadata_safe(src, content_hash=content_hash)
+
         if not dry_run:
             dest_dir.mkdir(parents=True, exist_ok=True)
-            if move:
-                shutil.move(str(src), str(final))
-            else:
-                shutil.copy2(str(src), str(final))
+            try:
+                if move:
+                    shutil.move(str(src), str(final))
+                else:
+                    shutil.copy2(str(src), str(final))
+            except OSError as e:
+                logger.error(
+                    "Failed to %s %s -> %s: %s",
+                    "move" if move else "copy",
+                    src,
+                    final,
+                    e,
+                )
+                # Still record whatever metadata we got, with error note
+                if collect_metadata and meta is not None:
+                    meta = dict(meta)
+                    meta["transfer_error"] = str(e)
+                    _record_metadata(
+                        result, src=src, final=final, content_hash=content_hash, meta=meta
+                    )
+                continue
+
+            # Sidecars travel with the photo (same basename / appended style)
+            transfer_sidecars(src, final, move=move, dry_run=False)
+
+            # Optional verification: if pre-move extract was a fallback/error and
+            # dest exists, retry from final path (never from vanished source).
+            if collect_metadata and meta is not None:
+                if meta.get("meta_source") == "fallback" or meta.get("meta_error"):
+                    if final.exists():
+                        meta = extract_metadata_safe(
+                            final,
+                            content_hash=content_hash,
+                            retry_path=None,
+                        )
+        else:
+            # dry-run: still plan sidecar moves for logging
+            transfer_sidecars(src, final, move=move, dry_run=True)
 
         hash_index[content_hash] = final
         decision = Decision(
@@ -246,16 +386,10 @@ def organize(
             dest_show = final if not dry_run else f"(dry-run) {final}"
             progress.item(i, total, f"{action} {src.name} -> {dest_show}")
 
-        if collect_metadata:
-            try:
-                meta = extract_metadata(final if not dry_run and not move else src)
-                # Prefer original source path for provenance; store dest too
-                meta["source"] = str(src)
-                meta["dest"] = str(final)
-                meta["content_hash"] = content_hash
-                result.metadata.append(meta)
-            except Exception as e:
-                logger.warning("Metadata extract failed for %s: %s", src, e)
+        if collect_metadata and meta is not None:
+            _record_metadata(
+                result, src=src, final=final, content_hash=content_hash, meta=meta
+            )
 
     # Inventory after: hashes present in dest (re-scan if not dry-run)
     if dry_run:

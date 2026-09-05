@@ -33,7 +33,8 @@ RAW_EXTENSIONS = {
     ".iiq", ".rwl", ".srw", ".x3f", ".mrw",
 }
 
-# ExifTool tags we request (-n = numeric where possible)
+# ExifTool tags we always want parsed into summary fields.
+# Full dump still comes back because we also request -All (see _run_exiftool_json).
 _EXIFTOOL_TAGS = [
     "-DateTimeOriginal",
     "-CreateDate",
@@ -131,6 +132,26 @@ def _parse_exif_datetime(raw: Any) -> Optional[dt.datetime]:
     return None
 
 
+def _jsonable(val: Any) -> Any:
+    """Make a value JSON-serializable for metadata inventory."""
+    if val is None or isinstance(val, (bool, int, float, str)):
+        return val
+    if isinstance(val, bytes):
+        return val.decode("utf-8", errors="replace")
+    if isinstance(val, (list, tuple)):
+        return [_jsonable(v) for v in val]
+    if isinstance(val, dict):
+        return {str(k): _jsonable(v) for k, v in val.items()}
+    if hasattr(val, "numerator") and hasattr(val, "denominator"):
+        den = val.denominator
+        return float(val.numerator) / float(den) if den else None
+    try:
+        json.dumps(val)
+        return val
+    except (TypeError, ValueError):
+        return str(val)
+
+
 def _empty_meta(path: Path) -> dict[str, Any]:
     return {
         "path": str(path),
@@ -143,7 +164,35 @@ def _empty_meta(path: Path) -> dict[str, Any]:
         "shutter": None,
         "iso": None,
         "meta_source": None,
+        "exif": {},
     }
+
+
+def fallback_metadata(
+    path: Path,
+    *,
+    error: Optional[str] = None,
+    content_hash: Optional[str] = None,
+) -> dict[str, Any]:
+    """
+    Minimal record when full EXIF extract fails.
+    Never silently drop a placed file from the inventory.
+    """
+    meta = _empty_meta(path)
+    meta["meta_source"] = "fallback"
+    if error:
+        meta["meta_error"] = str(error)
+    if content_hash is not None:
+        meta["content_hash"] = content_hash
+    try:
+        if path.exists():
+            meta["datetime"] = dt.datetime.fromtimestamp(path.stat().st_mtime).isoformat(sep=" ")
+    except OSError as e:
+        meta["meta_error"] = (
+            f"{meta.get('meta_error') + '; ' if meta.get('meta_error') else ''}"
+            f"mtime unavailable: {e}"
+        )
+    return meta
 
 
 def _pick_lens(data: dict[str, Any]) -> Optional[str]:
@@ -162,6 +211,8 @@ def _pick_lens(data: dict[str, Any]) -> Optional[str]:
 def _meta_from_exiftool_dict(path: Path, data: dict[str, Any]) -> dict[str, Any]:
     meta = _empty_meta(path)
     meta["meta_source"] = "exiftool"
+    # Keep richer dump so we do not throw away tags
+    meta["exif"] = {str(k): _jsonable(v) for k, v in data.items()}
 
     when = None
     for key in ("DateTimeOriginal", "CreateDate", "ModifyDate"):
@@ -169,8 +220,11 @@ def _meta_from_exiftool_dict(path: Path, data: dict[str, Any]) -> dict[str, Any]
         if when is not None:
             break
     if when is None:
-        when = dt.datetime.fromtimestamp(path.stat().st_mtime)
-    meta["datetime"] = when.isoformat(sep=" ")
+        try:
+            when = dt.datetime.fromtimestamp(path.stat().st_mtime)
+        except OSError:
+            when = None
+    meta["datetime"] = when.isoformat(sep=" ") if when else None
 
     make = data.get("Make")
     model = data.get("Model")
@@ -209,7 +263,10 @@ def _meta_from_exiftool_dict(path: Path, data: dict[str, Any]) -> dict[str, Any]
 
 
 def _run_exiftool_json(paths: list[Path]) -> list[dict[str, Any]]:
-    """Run exiftool -json -n on paths; return list of tag dicts (may be shorter on errors)."""
+    """
+    Run exiftool -json -n on paths; return list of tag dicts (may be shorter on errors).
+    Requests -All so the richer dump is available under meta['exif'].
+    """
     exe = exiftool_path()
     if not exe or not paths:
         return []
@@ -219,6 +276,7 @@ def _run_exiftool_json(paths: list[Path]) -> list[dict[str, Any]]:
         "-n",
         "-q",
         "-q",
+        "-All",
         *_EXIFTOOL_TAGS,
         "--",
         *[str(p) for p in paths],
@@ -236,6 +294,14 @@ def _run_exiftool_json(paths: list[Path]) -> list[dict[str, Any]]:
         return []
     out = (proc.stdout or "").strip()
     if not out:
+        if proc.returncode not in (0, None):
+            err = (proc.stderr or "").strip()
+            logger.warning(
+                "exiftool returned no JSON for %d path(s) (rc=%s): %s",
+                len(paths),
+                proc.returncode,
+                err[:500] if err else "(no stderr)",
+            )
         return []
     try:
         data = json.loads(out)
@@ -263,6 +329,7 @@ def extract_metadata_batch_exiftool(
     """
     Batch-read metadata with ExifTool.
     Returns map of resolved path str -> meta dict.
+    Files missing from exiftool output are omitted (caller should fall back).
     """
     result: dict[str, dict[str, Any]] = {}
     if not paths or not exiftool_available():
@@ -278,9 +345,13 @@ def extract_metadata_batch_exiftool(
         for row in rows:
             src = row.get("SourceFile")
             if src:
-                by_source[str(Path(src).resolve())] = row
+                try:
+                    by_source[str(Path(src).resolve())] = row
+                except OSError:
+                    pass
                 by_source[str(Path(src))] = row
 
+        missing: list[Path] = []
         for p in chunk:
             done += 1
             if progress is not None:
@@ -299,6 +370,14 @@ def extract_metadata_batch_exiftool(
                         break
             if row is not None:
                 result[key] = _meta_from_exiftool_dict(p, row)
+            else:
+                missing.append(p)
+        if missing:
+            logger.warning(
+                "exiftool batch missed %d/%d file(s) in chunk; callers should fall back",
+                len(missing),
+                len(chunk),
+            )
     return result
 
 
@@ -321,6 +400,15 @@ def _get_exif_dict(img: Image.Image) -> dict:
     return result
 
 
+def _pillow_exif_named(exif: dict) -> dict[str, Any]:
+    """Named, JSON-safe dump of Pillow EXIF for meta['exif']."""
+    named: dict[str, Any] = {}
+    for tag_id, val in exif.items():
+        name = ExifTags.TAGS.get(tag_id, str(tag_id))
+        named[name] = _jsonable(val)
+    return named
+
+
 def _extract_via_pillow(path: Path) -> dict[str, Any]:
     meta = _empty_meta(path)
     meta["meta_source"] = "pillow"
@@ -336,12 +424,19 @@ def _extract_via_pillow(path: Path) -> dict[str, Any]:
                 when = _parse_exif_datetime(exif.get(tag_id))
                 if when is not None:
                     break
-    except Exception:
+    except Exception as e:
+        logger.debug("Pillow open/exif failed for %s: %s", path, e)
         exif = {}
 
     if when is None:
-        when = dt.datetime.fromtimestamp(path.stat().st_mtime)
-    meta["datetime"] = when.isoformat(sep=" ")
+        try:
+            when = dt.datetime.fromtimestamp(path.stat().st_mtime)
+        except OSError:
+            when = None
+    meta["datetime"] = when.isoformat(sep=" ") if when else None
+
+    if exif:
+        meta["exif"] = _pillow_exif_named(exif)
 
     if not exif:
         return meta
@@ -426,8 +521,11 @@ def extract_metadata(path: Path) -> dict[str, Any]:
     """
     Collect camera metadata. Prefer ExifTool (reads lens tags on RAW the way
     Lightroom/Capture One do); fall back to Pillow for JPEG/PNG when needed.
+    Raises OSError if path cannot be read at all; callers may use fallback_metadata.
     """
     path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"No such file or directory: {path}")
     suffix = path.suffix.lower()
 
     # Always try ExifTool first when installed — critical for RAW lens/focal
@@ -441,6 +539,53 @@ def extract_metadata(path: Path) -> dict[str, Any]:
             for key in ("lens", "focal_length_mm", "aperture", "shutter", "iso", "camera"):
                 if meta.get(key) is None and pillow.get(key) is not None:
                     meta[key] = pillow[key]
+            # Merge pillow exif dump if exiftool dump is thin
+            if pillow.get("exif") and not meta.get("exif"):
+                meta["exif"] = pillow["exif"]
+            elif pillow.get("exif"):
+                for k, v in pillow["exif"].items():
+                    meta["exif"].setdefault(k, v)
             return meta
 
     return _extract_via_pillow(path)
+
+
+def extract_metadata_safe(
+    path: Path,
+    *,
+    content_hash: Optional[str] = None,
+    retry_path: Optional[Path] = None,
+) -> dict[str, Any]:
+    """
+    Extract metadata without raising. On failure, retry from retry_path if it
+    exists, then fall back to a minimal path/hash/datetime record (never silent drop).
+    """
+    path = Path(path)
+    err: Optional[BaseException] = None
+    for candidate in (path, retry_path):
+        if candidate is None:
+            continue
+        candidate = Path(candidate)
+        if not candidate.exists():
+            continue
+        try:
+            meta = extract_metadata(candidate)
+            if content_hash is not None:
+                meta["content_hash"] = content_hash
+            return meta
+        except Exception as e:
+            err = e
+            logger.warning("Metadata extract failed for %s: %s", candidate, e)
+
+    # Prefer a path that still exists for fallback mtime
+    fallback_path = path
+    if retry_path is not None and Path(retry_path).exists():
+        fallback_path = Path(retry_path)
+    elif not path.exists() and retry_path is not None:
+        fallback_path = Path(retry_path)
+
+    return fallback_metadata(
+        fallback_path,
+        error=str(err) if err else "metadata extract failed",
+        content_hash=content_hash,
+    )

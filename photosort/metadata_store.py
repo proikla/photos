@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any, Optional
 
 from photosort.exif_utils import (
-    extract_metadata,
     extract_metadata_batch_exiftool,
+    extract_metadata_safe,
     exiftool_available,
 )
 from photosort.hasher import sha256_file
 from photosort.organizer import iter_images
 
+logger = logging.getLogger("photosort")
 
 DEFAULT_METADATA_NAME = "photosort_metadata.json"
 
@@ -76,21 +78,32 @@ def scan_photos_for_metadata(
         # Progress already advanced in batch mode; still tick when falling back
         if progress is not None and not by_path:
             progress.item(i, total, label)
-        try:
-            key = str(path.resolve())
-            meta = by_path.get(key) or extract_metadata(path)
-            if hash_files:
-                try:
-                    meta["content_hash"] = sha256_file(path)
-                except OSError:
-                    meta["content_hash"] = None
+        content_hash = None
+        if hash_files:
+            try:
+                content_hash = sha256_file(path)
+            except OSError as e:
+                logger.warning("Could not hash %s: %s", path, e)
+                content_hash = None
+
+        key = str(path.resolve())
+        meta = by_path.get(key)
+        if meta is None:
+            # Batch miss or no exiftool: safe extract with fallback (never drop)
+            meta = extract_metadata_safe(path, content_hash=content_hash)
+        else:
+            meta = dict(meta)
+            if content_hash is not None:
+                meta["content_hash"] = content_hash
             else:
                 meta["content_hash"] = None
-            meta["source"] = str(path)
-            meta["dest"] = str(path)
-            records.append(meta)
-        except Exception:
-            continue
+
+        meta["source"] = str(path)
+        meta["dest"] = str(path)
+        if "content_hash" not in meta:
+            meta["content_hash"] = content_hash
+        records.append(meta)
+
     if progress is not None:
         with_lens = sum(1 for r in records if r.get("lens"))
         progress.done(
@@ -127,11 +140,11 @@ def resolve_metadata_records(
                 progress.phase(f"Loading metadata JSON: {path}")
             return load_metadata(path), f"json:{path}"
         # Single image file
-        meta = extract_metadata(path)
         try:
-            meta["content_hash"] = sha256_file(path)
+            content_hash = sha256_file(path)
         except OSError:
-            meta["content_hash"] = None
+            content_hash = None
+        meta = extract_metadata_safe(path, content_hash=content_hash)
         meta["source"] = str(path)
         meta["dest"] = str(path)
         return [meta], f"scan:{path}"

@@ -130,3 +130,30 @@ def test_progress_bar_contains_blocks():
     assert "█" in text
     assert "░" in text
     assert "50%" in text
+
+
+def test_cli_organize_move_writes_metadata_json(tmp_path: Path):
+    """Regression: --move must still populate photosort_metadata.json with EXIF."""
+    src = tmp_path / "src"
+    dest = tmp_path / "dest"
+    original = make_jpeg(
+        src / "m.jpg",
+        when=dt.datetime(2022, 6, 6, 10, 0, 0),
+        color=(12, 34, 56),
+        lens="CLI Move Lens",
+        focal=(40, 1),
+    )
+    rc = main(["organize", str(src), str(dest), "--move", "--quiet"])
+    assert rc == 0
+    assert not original.exists()
+    assert (dest / "2022" / "06" / "m.jpg").is_file()
+    meta_path = dest / "photosort_metadata.json"
+    assert meta_path.is_file()
+    import json
+    records = json.loads(meta_path.read_text(encoding="utf-8"))
+    assert len(records) == 1
+    assert records[0]["lens"] and "CLI Move Lens" in records[0]["lens"]
+    assert records[0]["focal_length_mm"] == 40
+    assert records[0].get("meta_source") != "fallback"
+    assert isinstance(records[0].get("exif"), dict)
+

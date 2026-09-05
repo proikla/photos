@@ -194,3 +194,179 @@ def test_decisions_logged_for_every_file(tmp_path: Path):
             "renamed_and_copied",
             "renamed_and_moved",
         }
+
+
+def test_move_preserves_metadata_in_result(tmp_path: Path):
+    """CRITICAL: with --move, metadata must be extracted BEFORE the file vanishes."""
+    src = tmp_path / "src"
+    dest = tmp_path / "dest"
+    original = make_jpeg(
+        src / "gone.jpg",
+        when=dt.datetime(2020, 2, 2, 15, 30, 0),
+        color=(44, 55, 66),
+        lens="MoveLens 50mm",
+        focal=(50, 1),
+        make="MoveCam",
+        model="M1",
+    )
+    assert original.is_file()
+    result = organize(src, dest, move=True)
+    assert not original.exists()
+    placed = dest / "2020" / "02" / "gone.jpg"
+    assert placed.is_file()
+    assert len(result.metadata) == 1
+    meta = result.metadata[0]
+    assert meta["content_hash"] == sha256_file(placed)
+    assert meta["lens"] and "MoveLens" in meta["lens"]
+    assert meta["focal_length_mm"] == 50
+    assert meta["camera"] and "MoveCam" in meta["camera"]
+    assert meta["datetime"] and meta["datetime"].startswith("2020-02-02")
+    assert str(meta["dest"]) == str(placed)
+    assert meta.get("meta_source") != "fallback"
+    assert isinstance(meta.get("exif"), dict)
+
+
+def test_metadata_extracted_before_move(tmp_path: Path, monkeypatch):
+    """Ensure extract runs against source path that still exists (not post-move)."""
+    import photosort.organizer as org
+
+    src = tmp_path / "src"
+    dest = tmp_path / "dest"
+    original = make_jpeg(
+        src / "ordered.jpg",
+        when=dt.datetime(2019, 8, 8),
+        color=(1, 2, 3),
+        lens="OrderLens",
+        focal=(35, 1),
+    )
+    seen_paths: list[Path] = []
+    real_safe = org.extract_metadata_safe
+
+    def tracking_safe(path, *, content_hash=None, retry_path=None):
+        seen_paths.append(Path(path))
+        assert Path(path).exists(), f"extract called on missing path: {path}"
+        return real_safe(path, content_hash=content_hash, retry_path=retry_path)
+
+    monkeypatch.setattr(org, "extract_metadata_safe", tracking_safe)
+    result = organize(src, dest, move=True)
+    assert not original.exists()
+    assert seen_paths, "extract_metadata_safe was never called"
+    assert seen_paths[0].name == "ordered.jpg"
+    assert len(result.metadata) == 1
+    assert result.metadata[0]["lens"] and "OrderLens" in result.metadata[0]["lens"]
+
+
+def test_move_with_collision_rename_preserves_metadata(tmp_path: Path):
+    src = tmp_path / "src"
+    dest = tmp_path / "dest"
+    existing = make_jpeg(
+        dest / "2020" / "01" / "shot.jpg",
+        when=dt.datetime(2020, 1, 1, 10, 0, 0),
+        color=(100, 0, 0),
+        lens="ExistingLens",
+        focal=(24, 1),
+    )
+    incoming = make_jpeg(
+        src / "shot.jpg",
+        when=dt.datetime(2020, 1, 1, 11, 0, 0),
+        color=(0, 100, 0),
+        lens="IncomingLens 85mm",
+        focal=(85, 1),
+    )
+    h_in = sha256_file(incoming)
+    result = organize(src, dest, move=True)
+    assert not incoming.exists()
+    assert existing.is_file()
+    files = list((dest / "2020" / "01").glob("shot*.jpg"))
+    assert len(files) == 2
+    assert result.renamed == 1
+    assert result.moved == 1
+    assert len(result.metadata) == 1
+    meta = result.metadata[0]
+    assert meta["content_hash"] == h_in
+    assert meta["lens"] and "IncomingLens" in meta["lens"]
+    assert meta["focal_length_mm"] == 85
+    assert Path(meta["dest"]).name.startswith("shot_")
+    assert Path(meta["dest"]).is_file()
+
+
+def test_sidecar_xmp_copied_with_photo(tmp_path: Path):
+    src = tmp_path / "src"
+    dest = tmp_path / "dest"
+    photo = make_jpeg(
+        src / "img.jpg",
+        when=dt.datetime(2021, 4, 4),
+        color=(10, 20, 30),
+    )
+    sidecar = src / "img.xmp"
+    sidecar.write_text("<x:xmpmeta>test</x:xmpmeta>\n", encoding="utf-8")
+    organize(src, dest, move=False)
+    assert photo.is_file()
+    assert sidecar.is_file()
+    assert (dest / "2021" / "04" / "img.jpg").is_file()
+    dest_sc = dest / "2021" / "04" / "img.xmp"
+    assert dest_sc.is_file()
+    assert dest_sc.read_text(encoding="utf-8") == sidecar.read_text(encoding="utf-8")
+
+
+def test_sidecar_xmp_and_aae_moved_with_photo(tmp_path: Path):
+    src = tmp_path / "src"
+    dest = tmp_path / "dest"
+    photo = make_jpeg(
+        src / "phone.jpg",
+        when=dt.datetime(2021, 5, 5),
+        color=(30, 20, 10),
+    )
+    xmp = src / "phone.xmp"
+    aae = src / "phone.aae"
+    xmp.write_text("xmp-data", encoding="utf-8")
+    aae.write_text("aae-data", encoding="utf-8")
+    organize(src, dest, move=True)
+    assert not photo.exists()
+    assert not xmp.exists()
+    assert not aae.exists()
+    assert (dest / "2021" / "05" / "phone.jpg").is_file()
+    assert (dest / "2021" / "05" / "phone.xmp").is_file()
+    assert (dest / "2021" / "05" / "phone.aae").is_file()
+    assert (dest / "2021" / "05" / "phone.xmp").read_text(encoding="utf-8") == "xmp-data"
+
+
+def test_sidecar_moves_with_collision_rename(tmp_path: Path):
+    src = tmp_path / "src"
+    dest = tmp_path / "dest"
+    make_jpeg(
+        dest / "2020" / "01" / "shot.jpg",
+        when=dt.datetime(2020, 1, 1),
+        color=(1, 0, 0),
+    )
+    make_jpeg(
+        src / "shot.jpg",
+        when=dt.datetime(2020, 1, 1),
+        color=(0, 1, 0),
+    )
+    (src / "shot.xmp").write_text("sidecar", encoding="utf-8")
+    result = organize(src, dest, move=True)
+    assert result.renamed == 1
+    renamed = [d for d in result.decisions if d.action.startswith("renamed")][0]
+    assert renamed.dest is not None
+    dest_sc = renamed.dest.with_suffix(".xmp")
+    assert dest_sc.is_file()
+    assert dest_sc.read_text(encoding="utf-8") == "sidecar"
+
+
+def test_copy_also_records_metadata_with_exif_dump(tmp_path: Path):
+    src = tmp_path / "src"
+    dest = tmp_path / "dest"
+    make_jpeg(
+        src / "c.jpg",
+        when=dt.datetime(2018, 3, 3),
+        color=(9, 8, 7),
+        lens="CopyLens",
+        focal=(28, 1),
+    )
+    result = organize(src, dest, move=False)
+    assert len(result.metadata) == 1
+    meta = result.metadata[0]
+    assert meta["lens"] and "CopyLens" in meta["lens"]
+    assert isinstance(meta.get("exif"), dict)
+    assert len(meta["exif"]) > 0
