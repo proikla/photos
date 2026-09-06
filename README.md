@@ -87,7 +87,8 @@ By default both `organize` and `stats` print live progress on stderr (`==> phase
 
 - `-v` / `--verbose` (`organize`): also echo every decision to stderr
 - `-q` / `--quiet`: hide progress; final summary/stats only
-- Full decision log for organize: `DEST/photosort.log` (override with `--log`)
+- Full technical decision log for organize: `DEST/photosort.log` (override with `--log`)
+- Human-readable action log: `DEST/photosort_actions.log` (MOVE/RENAME/SKIP/KEEP with why + short sha256 proof; override with `--actions-log`)
 
 ## Tests
 

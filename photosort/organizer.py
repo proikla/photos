@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Literal, Optional
 
+from photosort.decision_log import ActionLogger, format_action_entry, label_for_action, short_hash
 from photosort.exif_utils import extract_metadata_safe, get_photo_datetime
 from photosort.hasher import sha256_file
 
@@ -166,6 +167,7 @@ def transfer_sidecars(
     *,
     move: bool,
     dry_run: bool,
+    action_logger: ActionLogger | None = None,
 ) -> list[tuple[Path, Path]]:
     """Copy or move sidecars alongside the photo. Returns list of (src, dest) pairs."""
     transferred: list[tuple[Path, Path]] = []
@@ -175,9 +177,25 @@ def transfer_sidecars(
             # Avoid clobbering an existing sidecar; suffix like photo_1.xmp already
             # matches renamed dest stem. If still colliding, pick unique name.
             dest_sc = unique_dest_path(dest_sc.parent, dest_sc.name)
+        label = "MOVE" if move else "COPY"
+        why = "sidecar travels with photo"
+        if dry_run:
+            why = "sidecar travels with photo (dry-run)"
+        proof = f"sidecar of {src_photo.name}"
+        block = format_action_entry(
+            label=label,
+            title=f"{sc.name} (sidecar)",
+            why=why,
+            proof=proof,
+            from_path=sc,
+            to_path=dest_sc,
+        )
         if dry_run:
             transferred.append((sc, dest_sc))
-            logger.info("DRY-RUN sidecar %s -> %s", sc, dest_sc)
+            if action_logger is not None:
+                action_logger.log(block)
+            else:
+                logger.info("%s", block)
             continue
         dest_sc.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -186,12 +204,10 @@ def transfer_sidecars(
             else:
                 shutil.copy2(str(sc), str(dest_sc))
             transferred.append((sc, dest_sc))
-            logger.info(
-                "%s sidecar %s -> %s",
-                "MOVED" if move else "COPIED",
-                sc,
-                dest_sc,
-            )
+            if action_logger is not None:
+                action_logger.log(block)
+            else:
+                logger.info("%s", block)
         except OSError as e:
             logger.error("Failed to %s sidecar %s -> %s: %s", "move" if move else "copy", sc, dest_sc, e)
     return transferred
@@ -255,6 +271,33 @@ def _record_metadata(
     result.metadata.append(meta)
 
 
+
+def _emit_action(
+    action_logger: ActionLogger | None,
+    *,
+    label: str,
+    title: str,
+    why: str,
+    proof: str,
+    from_path: Path | str | None = None,
+    to_path: Path | str | None = None,
+) -> str:
+    """Format + emit one pretty action block (file via ActionLogger and/or logger)."""
+    block = format_action_entry(
+        label=label,
+        title=title,
+        why=why,
+        proof=proof,
+        from_path=from_path,
+        to_path=to_path,
+    )
+    if action_logger is not None:
+        action_logger.log(block)
+    else:
+        logger.info("%s", block)
+    return block
+
+
 def organize(
     source: Path,
     dest: Path | None = None,
@@ -265,6 +308,7 @@ def organize(
     recursive: bool = True,
     collect_metadata: bool = True,
     progress: Optional[Any] = None,
+    action_logger: ActionLogger | None = None,
 ) -> OrganizeResult:
     """
     Sort images from source into dest date folders with content-hash safety.
@@ -329,15 +373,25 @@ def organize(
             existing_at = hash_index[content_hash]
             if not _same_path(existing_at, src):
                 # True duplicate of another file → skip
+                sh = short_hash(content_hash)
+                reason = (
+                    f"exact duplicate; sha256={sh} already at {existing_at}"
+                )
                 decision = Decision(
                     source=src,
                     dest=None,
                     action="skipped_duplicate",
                     content_hash=content_hash,
-                    reason=f"identical content already at {existing_at}",
+                    reason=reason,
                 )
                 result.decisions.append(decision)
-                logger.info("SKIP duplicate %s (== %s)", src, existing_at)
+                _emit_action(
+                    action_logger,
+                    label="SKIP",
+                    title=src.name,
+                    why="exact duplicate",
+                    proof=f"sha256={sh} already at {existing_at}",
+                )
                 if progress is not None:
                     progress.item(i, total, f"skip duplicate {src.name}")
                 continue
@@ -353,15 +407,28 @@ def organize(
             meta: Optional[dict] = None
             if collect_metadata:
                 meta = extract_metadata_safe(src, content_hash=content_hash)
+            sh = short_hash(content_hash)
+            reason = f"already in correct date folder; sha256={sh}"
             decision = Decision(
                 source=src,
                 dest=intended,
                 action="skipped_already_sorted",
                 content_hash=content_hash,
-                reason="already_sorted",
+                reason=reason,
             )
             result.decisions.append(decision)
-            logger.info("SKIP already_sorted %s", src)
+            # Prefer a path relative to dest when possible for the title
+            try:
+                title = str(intended.relative_to(dest))
+            except ValueError:
+                title = intended.name
+            _emit_action(
+                action_logger,
+                label="KEEP",
+                title=title,
+                why="already in correct date folder",
+                proof=f"sha256={sh}",
+            )
             if progress is not None:
                 progress.item(i, total, f"already sorted {src.name}")
             if collect_metadata and meta is not None:
@@ -372,16 +439,33 @@ def organize(
             hash_index[content_hash] = intended
             continue
 
+        conflict_existing_hash: str | None = None
+        conflict_path: Path | None = None
         if intended.exists():
             # Name collision but different content (we already know hash differs /
             # not the same inode as src — that case was handled above).
+            conflict_path = intended
+            try:
+                conflict_existing_hash = sha256_file(intended)
+            except OSError:
+                # Fall back to reverse lookup in the hash index
+                for h, p in hash_index.items():
+                    if _same_path(p, intended):
+                        conflict_existing_hash = h
+                        break
             final = unique_dest_path(dest_dir, src.name)
             action: Action = "renamed_and_moved" if move else "renamed_and_copied"
-            reason = f"name conflict with different content; using {final.name}"
+            sh_new = short_hash(content_hash)
+            sh_old = short_hash(conflict_existing_hash) if conflict_existing_hash else "?"
+            reason = (
+                f"name taken by different content; using {final.name}; "
+                f"new=sha256={sh_new} existing=sha256={sh_old} at {intended}"
+            )
         else:
             final = intended
             action = "moved" if move else "copied"
-            reason = "ok"
+            sh = short_hash(content_hash)
+            reason = f"sort into date folder (EXIF); sha256={sh}"
 
         # CRITICAL: extract full metadata from SOURCE while it still exists
         # (before move/copy). Never read a vanished source after shutil.move.
@@ -414,7 +498,9 @@ def organize(
                 continue
 
             # Sidecars travel with the photo (same basename / appended style)
-            transfer_sidecars(src, final, move=move, dry_run=False)
+            transfer_sidecars(
+                src, final, move=move, dry_run=False, action_logger=action_logger
+            )
 
             # Optional verification: if pre-move extract was a fallback/error and
             # dest exists, retry from final path (never from vanished source).
@@ -428,7 +514,9 @@ def organize(
                         )
         else:
             # dry-run: still plan sidecar moves for logging
-            transfer_sidecars(src, final, move=move, dry_run=True)
+            transfer_sidecars(
+                src, final, move=move, dry_run=True, action_logger=action_logger
+            )
 
         hash_index[content_hash] = final
         decision = Decision(
@@ -439,12 +527,30 @@ def organize(
             reason=reason,
         )
         result.decisions.append(decision)
-        logger.info(
-            "%s %s -> %s (%s)",
-            action.upper(),
-            src,
-            final if not dry_run else f"(dry-run) {final}",
-            reason,
+
+        label = label_for_action(action)
+        sh = short_hash(content_hash)
+        if action.startswith("renamed"):
+            title = f"{src.name} → {final.name}"
+            why = "name taken by different content"
+            sh_old = short_hash(conflict_existing_hash) if conflict_existing_hash else "?"
+            proof = (
+                f"new=sha256={sh}  existing=sha256={sh_old} at {conflict_path or intended}"
+            )
+        else:
+            title = src.name
+            why = "sort into date folder (EXIF)"
+            if dry_run:
+                why = "sort into date folder (EXIF, dry-run)"
+            proof = f"sha256={sh}"
+        _emit_action(
+            action_logger,
+            label=label,
+            title=title,
+            why=why,
+            proof=proof,
+            from_path=src,
+            to_path=final if not dry_run else f"(dry-run) {final}",
         )
         if progress is not None:
             dest_show = final if not dry_run else f"(dry-run) {final}"

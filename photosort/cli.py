@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from photosort import __version__
+from photosort.decision_log import ActionLogger
 from photosort.metadata_store import (
     DEFAULT_METADATA_NAME,
     load_metadata,
@@ -75,12 +76,19 @@ def cmd_organize(args: argparse.Namespace) -> int:
     move = not bool(getattr(args, "copy", False))
 
     log_file = Path(args.log) if args.log else dest / "photosort.log"
+    actions_log = (
+        Path(args.actions_log)
+        if getattr(args, "actions_log", None)
+        else dest / "photosort_actions.log"
+    )
+    write_tech_log = not (args.dry_run and not args.log)
     _setup_logging(
         verbose=args.verbose,
         quiet=args.quiet,
-        log_file=None if args.dry_run and not args.log else log_file,
+        log_file=log_file if write_tech_log else None,
     )
     progress = Progress(quiet=args.quiet)
+    mode_label = "MOVE" if move else "COPY"
     if not args.quiet:
         if inplace:
             progress.status(
@@ -92,19 +100,41 @@ def cmd_organize(args: argparse.Namespace) -> int:
             + ("  dry-run" if args.dry_run else "")
             + ("  in-place" if inplace else "")
         )
-        if log_file and not (args.dry_run and not args.log):
-            progress.status(f"decision log: {log_file}")
+        if write_tech_log:
+            progress.status(f"technical log: {log_file}")
+        progress.status(f"actions log: {actions_log}")
+    else:
+        print(f"actions log: {actions_log}")
 
-    result = organize(
-        source,
-        dest,
-        depth=args.depth,
-        move=move,
-        dry_run=args.dry_run,
-        recursive=not args.no_recursive,
-        collect_metadata=True,
-        progress=progress,
-    )
+    action_logger = ActionLogger(actions_log)
+    try:
+        action_logger.write_header(
+            mode=mode_label,
+            source=source,
+            dest=dest,
+            depth=args.depth,
+            dry_run=args.dry_run,
+        )
+        result = organize(
+            source,
+            dest,
+            depth=args.depth,
+            move=move,
+            dry_run=args.dry_run,
+            recursive=not args.no_recursive,
+            collect_metadata=True,
+            progress=progress,
+            action_logger=action_logger,
+        )
+        action_logger.write_footer(
+            summary=(
+                f"done  copied/moved={result.copied + result.moved} "
+                f"renamed={result.renamed} skipped_dup={result.skipped} "
+                f"already_sorted={result.already_sorted}"
+            )
+        )
+    finally:
+        action_logger.close()
 
     meta_path = Path(args.metadata) if args.metadata else dest / DEFAULT_METADATA_NAME
     if result.metadata and not args.dry_run:
@@ -146,6 +176,7 @@ def cmd_organize(args: argparse.Namespace) -> int:
             print(f"  unexpected after: {len(extra)}", file=sys.stderr)
         return 1
     print("inventory: OK (unique content preserved)")
+    print(f"actions log: {actions_log}")
     if args.dry_run:
         print("(dry-run: no files written)")
     return 0
@@ -273,7 +304,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     org.add_argument("--dry-run", action="store_true", help="Log actions without writing")
     org.add_argument("--no-recursive", action="store_true", help="Do not scan subfolders")
-    org.add_argument("--log", help="Decision log file (default: DEST/photosort.log)")
+    org.add_argument(
+        "--log",
+        help="Technical decision log file (default: DEST/photosort.log)",
+    )
+    org.add_argument(
+        "--actions-log",
+        help="Human-readable actions log (default: DEST/photosort_actions.log)",
+    )
     org.add_argument(
         "--metadata",
         help=f"JSON metadata inventory path (default: DEST/{DEFAULT_METADATA_NAME})",
